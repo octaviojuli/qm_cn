@@ -1,0 +1,201 @@
+name: Deploy to Aliyun ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-aliyun
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  LAYER: deploy/layers/qmcn
+  REMOTE_DIR: /opt/qm
+  SANDBOX_IMAGE: qm-sandbox-local:latest
+
+jobs:
+  deploy:
+    name: Build on host and bring up
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+
+      - name: Vendor the pi coding agent
+        run: bash "$LAYER/scripts/vendor-pi.sh"
+
+      - name: Render docker-compose.yml
+        env:
+          QM_PUBLIC_URL: ${{ vars.QM_PUBLIC_URL }}
+          QM_AUTH_EMAIL_DOMAIN: ${{ vars.QM_AUTH_EMAIL_DOMAIN }}
+        run: |
+          set -euo pipefail
+          test -n "$QM_PUBLIC_URL" || { echo "::error::repository variable QM_PUBLIC_URL is not set"; exit 1; }
+          test -n "$QM_AUTH_EMAIL_DOMAIN" || { echo "::error::repository variable QM_AUTH_EMAIL_DOMAIN is not set"; exit 1; }
+          node "$LAYER/scripts/render-compose.ts"
+
+      - name: Show the rendered compose
+        run: cat "$LAYER/docker-compose.yml"
+
+      - name: Compute the sandbox image fingerprint
+        id: fingerprint
+        run: |
+          set -euo pipefail
+          fp="$(node --input-type=module -e '
+            const { computeSandboxImageFingerprint } = await import("./src/sandbox/local-sandbox.ts");
+            const fp = await computeSandboxImageFingerprint(process.cwd());
+            if (!fp) { console.error("cannot compute sandbox image fingerprint"); process.exit(1); }
+            console.log(fp);
+          ')"
+          echo "value=$fp" >> "$GITHUB_OUTPUT"
+
+      - name: Write the deployment .env
+        env:
+          CORE_SIGNING_SECRET: ${{ secrets.CORE_SIGNING_SECRET }}
+          CAPABILITY_SECRET: ${{ secrets.CAPABILITY_SECRET }}
+          PORTAL_IDENTITY_SECRET: ${{ secrets.PORTAL_IDENTITY_SECRET }}
+          CONNECTOR_SECRET_KEY: ${{ secrets.CONNECTOR_SECRET_KEY }}
+          SKILL_SIGNING_SECRET: ${{ secrets.SKILL_SIGNING_SECRET }}
+          PORTAL_SESSION_SECRET: ${{ secrets.PORTAL_SESSION_SECRET }}
+          AUTH_TOKEN_SECRET: ${{ secrets.AUTH_TOKEN_SECRET }}
+          AUTH_CLIENT_SECRET: ${{ secrets.AUTH_CLIENT_SECRET }}
+          AUTH_SIGNING_JWK: ${{ secrets.AUTH_SIGNING_JWK }}
+          AUTH_EMAIL_FROM: ${{ secrets.AUTH_EMAIL_FROM }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          PUBLIC_API_URL: ${{ secrets.PUBLIC_API_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in CORE_SIGNING_SECRET CAPABILITY_SECRET PORTAL_IDENTITY_SECRET CONNECTOR_SECRET_KEY \
+                      SKILL_SIGNING_SECRET PORTAL_SESSION_SECRET AUTH_TOKEN_SECRET AUTH_CLIENT_SECRET \
+                      AUTH_SIGNING_JWK AUTH_EMAIL_FROM SMTP_HOST SMTP_USERNAME SMTP_PASSWORD \
+                      PUBLIC_API_URL DATABASE_URL; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::missing repository secrets: ${missing[*]}"
+            exit 1
+          fi
+          weak=()
+          for name in CORE_SIGNING_SECRET CAPABILITY_SECRET PORTAL_IDENTITY_SECRET CONNECTOR_SECRET_KEY \
+                      SKILL_SIGNING_SECRET PORTAL_SESSION_SECRET AUTH_TOKEN_SECRET AUTH_CLIENT_SECRET; do
+            value="${!name}"
+            (( ${#value} >= 32 )) || weak+=("$name")
+          done
+          if (( ${#weak[@]} )); then
+            echo "::error::these secrets are shorter than the 32 characters core requires: ${weak[*]}"
+            exit 1
+          fi
+          umask 077
+          : > "$LAYER/.env"
+          for name in CORE_SIGNING_SECRET CAPABILITY_SECRET PORTAL_IDENTITY_SECRET CONNECTOR_SECRET_KEY \
+                      SKILL_SIGNING_SECRET PORTAL_SESSION_SECRET AUTH_TOKEN_SECRET AUTH_CLIENT_SECRET \
+                      AUTH_SIGNING_JWK AUTH_EMAIL_FROM SMTP_HOST SMTP_USERNAME SMTP_PASSWORD \
+                      PUBLIC_API_URL DATABASE_URL; do
+            printf '%s=%s\n' "$name" "${!name}" >> "$LAYER/.env"
+          done
+          echo "wrote $(wc -l < "$LAYER/.env") entries"
+
+      - name: Open the SSH channel
+        env:
+          ECS_SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$ECS_SSH_KEY" || { echo "::error::secret ECS_SSH_KEY is not set"; exit 1; }
+          test -n "$ECS_HOST" || { echo "::error::secret ECS_HOST is not set"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$ECS_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$ECS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          test -s ~/.ssh/known_hosts || { echo "::error::ssh-keyscan returned nothing for the host"; exit 1; }
+
+      - name: Ship the tree and the .env
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+        run: |
+          set -euo pipefail
+          tar --exclude=./.git --exclude=./node_modules --exclude='./**/node_modules' \
+              --exclude="./$LAYER/.env" -czf /tmp/qm-tree.tgz .
+          ssh -i ~/.ssh/id_deploy "$ECS_USER@$ECS_HOST" \
+            "set -eu; mkdir -p '$REMOTE_DIR'; rm -rf '$REMOTE_DIR'/*"
+          scp -i ~/.ssh/id_deploy /tmp/qm-tree.tgz "$ECS_USER@$ECS_HOST:/tmp/qm-tree.tgz"
+          ssh -i ~/.ssh/id_deploy "$ECS_USER@$ECS_HOST" \
+            "set -eu; tar -xzf /tmp/qm-tree.tgz -C '$REMOTE_DIR'; rm -f /tmp/qm-tree.tgz"
+          scp -i ~/.ssh/id_deploy "$LAYER/.env" "$ECS_USER@$ECS_HOST:$REMOTE_DIR/$LAYER/.env"
+          ssh -i ~/.ssh/id_deploy "$ECS_USER@$ECS_HOST" "chmod 600 '$REMOTE_DIR/$LAYER/.env'"
+
+      - name: Build the agent sandbox image
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+          FINGERPRINT: ${{ steps.fingerprint.outputs.value }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "$ECS_USER@$ECS_HOST" \
+            "REMOTE_DIR='$REMOTE_DIR' FINGERPRINT='$FINGERPRINT' SANDBOX_IMAGE='$SANDBOX_IMAGE' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$REMOTE_DIR"
+          docker build --platform linux/amd64 -f fly/Dockerfile -t qm-sandbox-base:dev .
+          docker build --platform linux/amd64 -f local/Dockerfile \
+            --build-arg BASE=qm-sandbox-base:dev \
+            --label "qm.sandbox-fingerprint=$FINGERPRINT" \
+            -t "$SANDBOX_IMAGE" .
+          REMOTE
+
+      - name: Build and bring up the control plane
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "$ECS_USER@$ECS_HOST" \
+            "LAYER_DIR='$REMOTE_DIR/$LAYER' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$LAYER_DIR"
+          docker compose build
+          docker compose up -d --remove-orphans
+          docker compose ps
+          REMOTE
+
+      - name: Wait for core to report healthy
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "$ECS_USER@$ECS_HOST" \
+            "LAYER_DIR='$REMOTE_DIR/$LAYER' bash -s" <<'REMOTE'
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8080/healthz >/dev/null; then
+              echo "core healthy after $attempt attempt(s)"
+              exit 0
+            fi
+            sleep 4
+          done
+          echo "core did not become healthy; last 80 log lines:" >&2
+          cd "$LAYER_DIR" && docker compose logs --tail 80 core >&2
+          exit 1
+          REMOTE
+
+      - name: Scrub the runner
+        if: always()
+        run: rm -f "$LAYER/.env" ~/.ssh/id_deploy /tmp/qm-tree.tgz

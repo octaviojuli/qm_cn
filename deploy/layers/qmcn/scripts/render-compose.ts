@@ -8,6 +8,23 @@ import { orgEnv } from "../../../../cli/src/services.ts";
 const layerDir = resolve(dirname(new URL(import.meta.url).pathname), "..");
 const { config } = loadConfigAt(join(layerDir, "qm.config.jsonc"));
 
+const publicUrlOverride = process.env.QM_PUBLIC_URL?.trim();
+if (publicUrlOverride) config.publicUrl = publicUrlOverride.replace(/\/$/, "");
+
+const emailDomainOverride = process.env.QM_AUTH_EMAIL_DOMAIN?.trim();
+if (emailDomainOverride && config.env.auth) config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN = emailDomainOverride;
+
+for (const [service, env] of Object.entries(config.env)) {
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (value.includes("REPLACE-WITH")) {
+      throw new Error(`env.${service}.${key} still holds a placeholder: ${value}`);
+    }
+  }
+}
+if (config.publicUrl.includes("REPLACE-WITH")) {
+  throw new Error(`publicUrl still holds a placeholder: ${config.publicUrl} (set QM_PUBLIC_URL)`);
+}
+
 const HOST_PORT_OFFSET: Record<string, number | undefined> = {
   core: 0,
   portal: 1,
@@ -76,7 +93,10 @@ for (const service of config.services) {
   const offset = HOST_PORT_OFFSET[service];
   const block: string[] = [
     `  ${service}:`,
-    `    image: \${ACR_REGISTRY}/qm-${service}:\${QM_IMAGE_TAG}`,
+    `    image: qm-${service}:local`,
+    `    build:`,
+    `      context: ../../..`,
+    `      dockerfile: deploy/${service}/Dockerfile`,
     `    container_name: ${config.orgId}-${service}`,
     `    restart: unless-stopped`,
     `    networks: [qm]`,

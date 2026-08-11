@@ -1,7 +1,8 @@
 # 阿里云 ECS 自托管部署手册
 
 这份手册部署的形态是:**控制面五个容器跑在一台 ECS 上,agent 沙箱用本机 Docker(`SANDBOX_BACKEND=local`),
-状态落阿里云 RDS PostgreSQL,镜像走 ACR。** 不接 OSS,不接 Slack,不接任何境外模型厂商。
+状态落阿里云 RDS PostgreSQL,镜像在主机本地构建。** 不接 OSS,不接 ACR,不接 Slack,不接任何境外模型厂商。
+部署由 GitHub Actions 通过 SSH 推,平时不需要登录 ECS。
 
 ## 为什么不用 `qm up`
 
@@ -30,60 +31,52 @@ QM 自带的 CLI 有三个部署目标(`docker` / `fly` / `aws`),但**没有一�
 | ------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | ECS                 | ≥ 8 vCPU / 16 GiB,系统盘 ≥ 100 GiB  | 5 个控制面容器 + **每个 scope 一个常驻沙箱容器**。沙箱是 `resident_disk`,不自动回收,按人数估容量而不是按并发 |
 | RDS PostgreSQL      | 基础版即可,开启 SSL                 | 36 张表由各模块启动时幂等自建,无需预置 schema                                                                |
-| ACR 容器镜像服务    | 一个命名空间                        | 官方镜像不存在(`cli/manifest.json` 里是 `registry.invalid` 占位符),必须自建                                  |
-| 镜像加速器          | 容器镜像服务的加速地址              | 基础镜像是 digest 固定的 `node:24-alpine` / `node:24-slim`,直连 Docker Hub 不稳                              |
+| 镜像加速器          | 容器镜像服务的加速地址              | 基础镜像是 digest 固定的 `node:24-alpine` / `node:24-slim`,主机直连 Docker Hub 不稳                          |
 | 域名 + 证书         | 公网访问需 ICP 备案                 | Portal 是公网门面。纯内网部署可跳过                                                                          |
 | 邮件推送 DirectMail | 一个发信域名                        | 登录链接靠它发。也可用任意支持 TLS 的 SMTP                                                                   |
 | 模型服务            | 百炼 / DashScope 等 OpenAI 兼容端点 | 部署后在 Admin 页注册为自定义 provider                                                                       |
 
-ECS 上需要:Docker、Node ≥ 24.15(仅用于跑 CLI 与构建脚本)、git。
+ECS 主机上只需要三样:**Docker(含 compose 插件)、sshd、`curl`**。不需要 Node,不需要 git ——
+需要 Node 的步骤全部在 GitHub runner 上完成。部署账号要能免密 `docker`(在 `docker` 组里),
+并对 `/opt/qm` 有写权限。
 
-## 部署步骤
+## 部署方式:GitHub Actions 推,主机构建
 
-### 1. Vendor pi 依赖
+部署由 `.github/workflows/deploy-aliyun.yml` 驱动,手动触发(`workflow_dispatch`)。
+**ECS 主机上只需要 Docker、docker compose 插件和 sshd** —— 不需要 Node、不需要 git、不需要 ACR。
 
-`@earendil-works/pi-coding-agent` 是一个 GitHub Release tarball,不在 npm registry 上,
-npm 镜像源代理不了它。而 `deploy/core/Dockerfile` 里有 `npm ci`,所以**镜像构建时**就需要它。
+分工的依据很实际:runner 在境外,拉 GitHub Release 和 npm 都顺,所以
+**vendor pi 依赖、渲染 compose、算沙箱镜像 fingerprint 都在 runner 上做**;
+镜像构建和运行在 ECS 上做,避免把几个 GB 的镜像跨境推来推去。
 
-```bash
-bash deploy/layers/qmcn/scripts/vendor-pi.sh
-```
+一次运行的顺序:
 
-脚本把 tarball 下到 `vendor/`、记下 sha256、把 `package.json` 指向 `file:vendor/<name>.tgz`、
-重算 lockfile。`.dockerignore` 没有排除 `vendor/`,构建上下文能带上。
+1. checkout,按 `.node-version` 装 Node
+2. `scripts/vendor-pi.sh` —— 把 pi 的 tarball 抓进 `vendor/` 并改写依赖指向
+3. `scripts/render-compose.ts` —— 用仓库变量注入真实域名后生成 compose
+4. 把渲染结果打进 job 日志(其中只有 `${VAR}` 引用,没有密钥值,可安全查看)
+5. 算沙箱镜像 fingerprint
+6. 用仓库密钥写出 `.env`,并**在 runner 上先校验**:缺项直接失败,签名类密钥不足 32 字符也直接失败
+7. `ssh-keyscan` 建立 known_hosts,打包工作树 scp 到主机 `/opt/qm`,`.env` 单独传并 `chmod 600`
+8. 主机上构建沙箱镜像(`fly/Dockerfile` 打底,叠 `local/Dockerfile`)
+9. 主机上 `docker compose build && up -d --remove-orphans`
+10. 轮询 `/healthz`,最多 30 次 × 4 秒;失败则把 core 最后 80 行日志打出来再退出非零
+11. 无论成败都清掉 runner 上的 `.env`、私钥和 tar 包
 
-这一步会改 `package.json` 与 `package-lock.json` —— **本 fork 唯一必须偏离上游的核心文件**,记进下面的偏离清单。
+### 需要在仓库里配的东西
 
-### 2. 构建并推送镜像
+**Secrets**(Settings → Secrets and variables → Actions → Secrets):
 
-```bash
-export ACR_REGISTRY=registry.cn-hangzhou.aliyuncs.com/<your-namespace>
-docker login "$ACR_REGISTRY"
-bash deploy/layers/qmcn/scripts/build-push-acr.sh
-```
+连接主机的三个 —— `ECS_HOST`、`ECS_USER`、`ECS_SSH_KEY`(私钥全文)。
 
-它构建并推送 `qm-core` / `qm-web-ui` / `qm-admin` / `qm-portal` / `qm-auth` 五个镜像
-(全部以仓库根为构建上下文),然后调用仓库自带的 `scripts/local-sandbox-build.sh` 构建 agent 沙箱镜像
-`qm-sandbox-local:latest`(基础层来自 `fly/Dockerfile`,叠加 `local/Dockerfile`)。
-沙箱镜像留在 ECS 本机,不需要推 ACR。
+应用密钥十五个,与 `qm check` 输出的权威清单一致(已交叉校验),外加自托管特有的 `DATABASE_URL`:
 
-脚本会在构建前拒绝未 vendor 的树,避免在 `npm ci` 那一步才失败。
+`CORE_SIGNING_SECRET` `CAPABILITY_SECRET` `PORTAL_IDENTITY_SECRET` `CONNECTOR_SECRET_KEY`
+`SKILL_SIGNING_SECRET` `PORTAL_SESSION_SECRET` `AUTH_TOKEN_SECRET` `AUTH_CLIENT_SECRET`
+`AUTH_SIGNING_JWK` `AUTH_EMAIL_FROM` `SMTP_HOST` `SMTP_USERNAME` `SMTP_PASSWORD`
+`PUBLIC_API_URL` `DATABASE_URL`
 
-### 3. 填配置与密钥
-
-编辑 `qm.config.jsonc`,替换两个占位:
-
-- `publicUrl` → 你的公网地址(或内网地址)
-- `env.auth.AUTH_ALLOWED_EMAIL_DOMAIN` → 允许登录的邮箱域名
-
-改完重新生成 compose:
-
-```bash
-node deploy/layers/qmcn/scripts/render-compose.ts
-```
-
-然后 `cp .env.aliyun.example .env` 并填值。签名类密钥**至少 32 字符**
-(`MIN_SIGNING_SECRET_LENGTH = 32`,不达标 core 会在启动时报
+前八个是签名/加密密钥,**必须至少 32 字符**(`MIN_SIGNING_SECRET_LENGTH = 32`;不达标 core 启动时报
 `missing or insecure required core secrets`):
 
 ```bash
@@ -96,24 +89,41 @@ openssl rand -hex 32
 node -e "const {generateKeyPairSync}=require('node:crypto');process.stdout.write(JSON.stringify(generateKeyPairSync('ec',{namedCurve:'P-256'}).privateKey.export({format:'jwk'})))"
 ```
 
-必需密钥集与 `qm check` 输出的权威清单一致,已交叉校验过:
-`AUTH_CLIENT_SECRET` `AUTH_EMAIL_FROM` `AUTH_SIGNING_JWK` `AUTH_TOKEN_SECRET` `CAPABILITY_SECRET`
-`CONNECTOR_SECRET_KEY` `CORE_SIGNING_SECRET` `PORTAL_IDENTITY_SECRET` `PORTAL_SESSION_SECRET`
-`PUBLIC_API_URL` `SKILL_SIGNING_SECRET` `SMTP_HOST` `SMTP_PASSWORD` `SMTP_USERNAME`,外加自托管特有的
-`DATABASE_URL`。
+**Variables**(同一页面的 Variables 标签,非密钥):
 
-### 4. 起服务
+- `QM_PUBLIC_URL` —— 部署的公网地址,例如 `https://qm.example.com`
+- `QM_AUTH_EMAIL_DOMAIN` —— 允许登录的邮箱域名
+
+这两项以变量而非提交值的形式存在,是为了让 `qm.config.jsonc` 留在仓库里当模板。
+`render-compose.ts` 有占位符守卫:两者任一未注入就直接报错,不会渲染出一份带
+`REPLACE-WITH-…` 的 compose 悄悄部署上去。
+
+### 触发
+
+Actions → Deploy to Aliyun ECS → Run workflow。`ref` 输入可留空(用当前分支)。
+`concurrency` 保证不会有两次部署叠在一起。
+
+工作流只在手动触发时运行。若要改成推到 `main` 即部署,给 `on:` 加一个 `push` 触发器 ——
+但第一次上线前建议保持手动。
+
+### 手动兜底
+
+主机上装了 Node ≥ 24 的话,同一套东西可以手工跑:
 
 ```bash
-cd deploy/layers/qmcn
-docker compose up -d
-docker compose ps
-docker compose logs -f core
+cp deploy/layers/qmcn/.env.aliyun.example deploy/layers/qmcn/.env   # 填值
+bash deploy/layers/qmcn/scripts/vendor-pi.sh
+QM_PUBLIC_URL=https://qm.example.com QM_AUTH_EMAIL_DOMAIN=example.com \
+  node deploy/layers/qmcn/scripts/render-compose.ts
+bash scripts/local-sandbox-build.sh
+cd deploy/layers/qmcn && docker compose up -d --build
 ```
 
 core 日志出现 `[qm] listening on :8080 (org=qmcn, store=postgres, runStore=postgres, ...)` 即为正常。
 
-端口(全部只绑 `127.0.0.1`,由 SLB 或本机 Nginx 反代出去):
+### 端口
+
+全部只绑 `127.0.0.1`,由 SLB 或本机 Nginx 反代出去:
 
 | 服务   | 本机端口     |
 | ------ | ------------ |
@@ -125,7 +135,7 @@ core 日志出现 `[qm] listening on :8080 (org=qmcn, store=postgres, runStore=p
 
 对外只需暴露 **portal**(8081) —— 它按路径前缀反代 web-ui、admin 与 auth。
 
-### 5. 注册模型 provider
+## 部署后:注册模型 provider
 
 部署时没有配 `modelProvider`,所以此刻还没有可用模型。用 Admin 页面注册一个自定义 provider:
 
@@ -175,16 +185,30 @@ psql "$DATABASE_URL" -c "\dt" | head -20
 
 治理类控制(身份、作用域、审批、审计)不受影响,与 microVM 形态一致。
 
+还有一条来自部署方式本身的取舍,与沙箱无关:
+
+4. **CI 持有全部签名与加密密钥。** 密钥存在 GitHub Secrets 里,每次部署由 workflow 写成 `.env`。
+   这意味着任何能修改 workflow 或触发它的人,都能间接拿到 `CONNECTOR_SECRET_KEY`(连接器凭据的加密密钥)
+   和全部签名密钥。**这个暴露是不可撤销的** —— 一旦想收回,必须轮换全部密钥,而
+   `CONNECTOR_SECRET_KEY` 的轮换会牵动已加密存储的连接器凭据。
+   若日后要收紧,顺序是:把密钥迁到阿里云 KMS / 凭据管家,让主机在部署时自取,CI 只保留 SSH 权限;
+   然后轮换所有曾进过 CI 的密钥。建议同时给这条 workflow 加 GitHub Environment 保护规则
+   (必需审批人 + 分支限制),把"谁能触发部署"收窄。
+
 ## 本 fork 的偏离清单
 
 自用 fork 不向上游投稿,但仍需记录偏离,否则 `update-qm` 合并时无从判断冲突该怎么解。
 
-| 文件                    | 偏离                                                          | 原因                                  |
-| ----------------------- | ------------------------------------------------------------- | ------------------------------------- |
-| `package.json`          | `@earendil-works/pi-coding-agent` 由 URL 改为 `file:vendor/…` | GitHub Release tarball 在国内拉取不稳 |
-| `package-lock.json`     | 随上一条重算                                                  | 同上                                  |
-| `vendor/*.tgz`          | 新增                                                          | 被 vendor 的依赖本体                  |
-| `deploy/layers/qmcn/**` | 新增                                                          | 组织层,按契约不属于 core              |
+| 文件                                  | 偏离                                                          | 原因                                           |
+| ------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------- |
+| `.github/workflows/deploy-aliyun.yml` | 新增                                                          | 上游明确不带生产部署 workflow;CI 目录属于 core |
+| `package.json`                        | `@earendil-works/pi-coding-agent` 由 URL 改为 `file:vendor/…` | GitHub Release tarball 在国内拉取不稳          |
+| `package-lock.json`                   | 随上一条重算                                                  | 同上                                           |
+| `vendor/*.tgz`                        | 新增                                                          | 被 vendor 的依赖本体                           |
+| `deploy/layers/qmcn/**`               | 新增                                                          | 组织层,按契约不属于 core                       |
 
-除此之外 core 保持与上游一致。合并上游时若这两个文件冲突,保留本地的 `file:` 指向并重跑
-`scripts/vendor-pi.sh`(它对已 vendor 的树是幂等的)。
+注:`package.json` / `package-lock.json` / `vendor/` 三项由 `vendor-pi.sh` 在 **CI runner 上**每次运行时
+产生,**不提交进仓库**。它们仍然列在这里,因为构建产物的依赖来源确实偏离了上游,排查问题时需要知道。
+
+除此之外 core 保持与上游一致。若日后改为在本地提交 vendor 结果,合并上游时保留本地的 `file:` 指向
+并重跑 `scripts/vendor-pi.sh`(它对已 vendor 的树是幂等的)。
