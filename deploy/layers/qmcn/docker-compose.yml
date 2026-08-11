@@ -1,0 +1,129 @@
+name: qmcn
+
+networks:
+  qm:
+    name: qmcn
+
+volumes:
+  coredata:
+
+services:
+  core:
+    image: ${ACR_REGISTRY}/qm-core:${QM_IMAGE_TAG}
+    container_name: qmcn-core
+    restart: unless-stopped
+    networks: [qm]
+    environment:
+      ORG_ID: "qmcn"
+      PUBLIC_WEB_URL: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example"
+      WEB_UI_PUBLIC_URL: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example"
+      PORT: "8080"
+      DATA_DIR: "/data"
+      SESSION_STORE: "postgres"
+      RUN_STORE: "postgres"
+      SANDBOX_BACKEND: "local"
+      LOCAL_SANDBOX_IMAGE: "${LOCAL_SANDBOX_IMAGE:-qm-sandbox-local:latest}"
+      ARTIFACT_STORE: "postgres"
+      SNAPSHOT_STORE: "local"
+      TRANSFER_STORE: "local"
+      HARNESS: "pi"
+      NODE_ENV: "production"
+      HARNESS_SECURITY_POSTURE: "auto"
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET:?set CORE_SIGNING_SECRET in .env}
+      CAPABILITY_SECRET: ${CAPABILITY_SECRET:?set CAPABILITY_SECRET in .env}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET:?set PORTAL_IDENTITY_SECRET in .env}
+      CONNECTOR_SECRET_KEY: ${CONNECTOR_SECRET_KEY:?set CONNECTOR_SECRET_KEY in .env}
+      SKILL_SIGNING_SECRET: ${SKILL_SIGNING_SECRET:?set SKILL_SIGNING_SECRET in .env}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:?set PUBLIC_API_URL in .env}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - coredata:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./sandbox/skills:/layer/skills:ro
+      - ./sandbox/tools:/layer/tools:ro
+
+  web-ui:
+    image: ${ACR_REGISTRY}/qm-web-ui:${QM_IMAGE_TAG}
+    container_name: qmcn-web-ui
+    restart: unless-stopped
+    networks: [qm]
+    environment:
+      PORT: "8080"
+      CORE_API_URL: "http://core:8080"
+      CORE_ORG_ID: "qmcn"
+      WEB_UI_PUBLIC_URL: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example"
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET:?set CORE_SIGNING_SECRET in .env}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET:?set PORTAL_IDENTITY_SECRET in .env}
+    ports: ["127.0.0.1:8082:8080"]
+    depends_on: [core]
+
+  admin:
+    image: ${ACR_REGISTRY}/qm-admin:${QM_IMAGE_TAG}
+    container_name: qmcn-admin
+    restart: unless-stopped
+    networks: [qm]
+    environment:
+      PORT: "8080"
+      CORE_API_URL: "http://core:8080"
+      CORE_ORG_ID: "qmcn"
+      ADMIN_BASE_PATH: "/admin"
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET:?set CORE_SIGNING_SECRET in .env}
+    ports: ["127.0.0.1:8083:8080"]
+    depends_on: [core]
+
+  portal:
+    image: ${ACR_REGISTRY}/qm-portal:${QM_IMAGE_TAG}
+    container_name: qmcn-portal
+    restart: unless-stopped
+    networks: [qm]
+    environment:
+      PORT: "8080"
+      CORE_API_URL: "http://core:8080"
+      CORE_ORG_ID: "qmcn"
+      PORTAL_PUBLIC_URL: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example"
+      WEB_UI_UPSTREAM: "http://web-ui:8080"
+      ADMIN_UPSTREAM: "http://admin:8080"
+      AUTH_BROKER_UPSTREAM: "http://auth:8080"
+      AUTH_BROKER_PREFIX: "/idp"
+      OIDC_CLIENT_ID: "qm-portal"
+      OIDC_ISSUER: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example/idp"
+      OIDC_AUTH_ENDPOINT: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example/idp/authorize"
+      OIDC_TOKEN_ENDPOINT: "http://auth:8080/token"
+      OIDC_USERINFO_ENDPOINT: "http://auth:8080/userinfo"
+      OIDC_JWKS_URI: "http://auth:8080/.well-known/jwks.json"
+      OIDC_SCOPES: "openid email"
+      OIDC_PRINCIPAL_CLAIM: "email"
+      OIDC_ALLOWED_EMAIL_DOMAIN: "REPLACE-WITH-YOUR-EMAIL-DOMAIN.example"
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET:?set CORE_SIGNING_SECRET in .env}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET:?set PORTAL_IDENTITY_SECRET in .env}
+      PORTAL_SESSION_SECRET: ${PORTAL_SESSION_SECRET:?set PORTAL_SESSION_SECRET in .env}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:?set AUTH_CLIENT_SECRET in .env}
+    ports: ["127.0.0.1:8081:8080"]
+    depends_on: [core]
+
+  auth:
+    image: ${ACR_REGISTRY}/qm-auth:${QM_IMAGE_TAG}
+    container_name: qmcn-auth
+    restart: unless-stopped
+    networks: [qm]
+    environment:
+      PORT: "8080"
+      CORE_API_URL: "http://core:8080"
+      CORE_ORG_ID: "qmcn"
+      AUTH_ISSUER: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example/idp"
+      AUTH_CLIENT_ID: "qm-portal"
+      AUTH_REDIRECT_URI: "https://qm.REPLACE-WITH-YOUR-DOMAIN.example/auth/callback"
+      AUTH_EMAIL_TRANSPORT: "smtp"
+      AUTH_ALLOWED_EMAIL_DOMAIN: "REPLACE-WITH-YOUR-EMAIL-DOMAIN.example"
+      SMTP_PORT: "465"
+      SMTP_TLS: "implicit"
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET:?set CORE_SIGNING_SECRET in .env}
+      AUTH_SIGNING_JWK: ${AUTH_SIGNING_JWK:?set AUTH_SIGNING_JWK in .env}
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:?set AUTH_TOKEN_SECRET in .env}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:?set AUTH_CLIENT_SECRET in .env}
+      AUTH_EMAIL_FROM: ${AUTH_EMAIL_FROM:?set AUTH_EMAIL_FROM in .env}
+      SMTP_HOST: ${SMTP_HOST:?set SMTP_HOST in .env}
+      SMTP_USERNAME: ${SMTP_USERNAME:?set SMTP_USERNAME in .env}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:?set SMTP_PASSWORD in .env}
+    depends_on: [core]
