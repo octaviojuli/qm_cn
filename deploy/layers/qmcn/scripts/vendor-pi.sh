@@ -29,8 +29,31 @@ else
   echo "    already present, skipping download"
 fi
 
-echo "==> recording sha256 for the deviation log"
-sha256sum "$VENDOR_DIR/$TARBALL_NAME" | tee "$VENDOR_DIR/$TARBALL_NAME.sha256"
+EXPECTED_FILE="$(dirname "${BASH_SOURCE[0]}")/../pi-tarball.sha256"
+
+echo "==> verifying sha256 against $EXPECTED_FILE"
+if [[ ! -f "$EXPECTED_FILE" ]]; then
+  echo "no pinned digest at $EXPECTED_FILE — refusing to vendor an unverified tarball." >&2
+  echo "record one with: sha256sum $VENDOR_DIR/$TARBALL_NAME > $EXPECTED_FILE" >&2
+  exit 1
+fi
+
+EXPECTED="$(awk -v name="$TARBALL_NAME" '$2 == name {print $1}' "$EXPECTED_FILE")"
+if [[ -z "$EXPECTED" ]]; then
+  echo "$EXPECTED_FILE has no digest for $TARBALL_NAME — the dependency URL changed." >&2
+  echo "verify the new release, then record: sha256sum $VENDOR_DIR/$TARBALL_NAME > $EXPECTED_FILE" >&2
+  exit 1
+fi
+
+ACTUAL="$(sha256sum "$VENDOR_DIR/$TARBALL_NAME" | awk '{print $1}')"
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+  echo "sha256 mismatch for $TARBALL_NAME" >&2
+  echo "  expected $EXPECTED" >&2
+  echo "  actual   $ACTUAL" >&2
+  rm -f "$VENDOR_DIR/$TARBALL_NAME"
+  exit 1
+fi
+echo "    ok: $ACTUAL"
 
 echo "==> repointing package.json at vendor/$TARBALL_NAME"
 node -e '

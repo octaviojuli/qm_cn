@@ -52,29 +52,50 @@ ECS 主机上只需要三样:**Docker(含 compose 插件)、sshd、`curl`**。�
 一次运行的顺序:
 
 1. checkout,按 `.node-version` 装 Node
-2. `scripts/vendor-pi.sh` —— 把 pi 的 tarball 抓进 `vendor/` 并改写依赖指向
-3. `scripts/render-compose.ts` —— 用仓库变量注入真实域名后生成 compose
-4. 把渲染结果打进 job 日志(其中只有 `${VAR}` 引用,没有密钥值,可安全查看)
-5. 算沙箱镜像 fingerprint
-6. 用仓库密钥写出 `.env`,并**在 runner 上先校验**:缺项直接失败,签名类密钥不足 32 字符也直接失败
-7. `ssh-keyscan` 建立 known_hosts,打包工作树 scp 到主机 `/opt/qm`,`.env` 单独传并 `chmod 600`
-8. 主机上构建沙箱镜像(`fly/Dockerfile` 打底,叠 `local/Dockerfile`)
-9. 主机上 `docker compose build && up -d --remove-orphans`
-10. 轮询 `/healthz`,最多 30 次 × 4 秒;失败则把 core 最后 80 行日志打出来再退出非零
-11. 无论成败都清掉 runner 上的 `.env`、私钥和 tar 包
+2. `scripts/vendor-pi.sh` —— 抓 pi 的 tarball,**先比对 `pi-tarball.sha256` 里固定的摘要**,不符就删文件并失败,然后改写依赖指向
+3. `npm ci` —— fingerprint 那步要 import `local-sandbox.ts`,它的依赖图牵到 `pi-ai`/`pg`/`jose`,没有依赖会直接 `ERR_MODULE_NOT_FOUND`
+4. `scripts/render-compose.ts` —— 注入真实域名,生成 compose,同时导出 `.generated/secret-map`
+5. 把渲染结果和密钥映射表打进 job 日志(只有 `${VAR}` 引用和名字,没有值,可安全查看)
+6. 算沙箱镜像 fingerprint
+7. 按映射表写出 `.env`,并**在 runner 上先校验**(见下)
+8. 用固定的主机公钥建立 SSH,打包工作树传到 `/opt/qm.incoming`,**解包成功后**才原子换到 `/opt/qm`(旧树留作 `/opt/qm.previous`)
+9. 主机上构建沙箱镜像(`fly/Dockerfile` 打底,叠 `local/Dockerfile`)
+10. 主机上 `docker compose build && up -d --remove-orphans`
+11. 轮询 core 的 `/healthz`(端口取自渲染结果,不写死),**然后确认每一个服务都是 running** —— 只探 core 会让 portal 挂掉却报成功
+12. 无论成败都清掉 runner 上的 `.env`、私钥和 tar 包
 
 ### 需要在仓库里配的东西
 
 **Secrets**(Settings → Secrets and variables → Actions → Secrets):
 
-连接主机的三个 —— `ECS_HOST`、`ECS_USER`、`ECS_SSH_KEY`(私钥全文)。
+连接主机的四个:
 
-应用密钥十五个,与 `qm check` 输出的权威清单一致(已交叉校验),外加自托管特有的 `DATABASE_URL`:
+| 名字              | 内容                           |
+| ----------------- | ------------------------------ |
+| `HOST`            | ECS 的地址                     |
+| `USER`            | 部署账号                       |
+| `SSH_KEY`         | 私钥全文                       |
+| `SSH_KNOWN_HOSTS` | `ssh-keyscan -H <host>` 的输出 |
+
+`SSH_KNOWN_HOSTS` 是**必填**的:全部密钥都会复制到这台主机上,所以它的身份必须事先固定,而不是每次运行现学现信。
+少了它 workflow 会直接失败并告诉你生成命令。
+
+应用密钥十五个:
 
 `CORE_SIGNING_SECRET` `CAPABILITY_SECRET` `PORTAL_IDENTITY_SECRET` `CONNECTOR_SECRET_KEY`
 `SKILL_SIGNING_SECRET` `PORTAL_SESSION_SECRET` `AUTH_TOKEN_SECRET` `AUTH_CLIENT_SECRET`
 `AUTH_SIGNING_JWK` `AUTH_EMAIL_FROM` `SMTP_HOST` `SMTP_USERNAME` `SMTP_PASSWORD`
 `PUBLIC_API_URL` `DATABASE_URL`
+
+可选:`ANTHROPIC_API_KEY`、`OPENROUTER_API_KEY`(接国产模型时都不需要)。
+
+**不要手工维护每个服务拿哪些密钥。** `render-compose.ts` 用 CLI 自己的
+`computedSecrets()` / `secretDestinations()` 算出来并写进 `.generated/secret-map`,
+其中包含别名 —— 例如 portal 读的是 `OIDC_CLIENT_SECRET`,值来自 `AUTH_CLIENT_SECRET`,
+workflow 按映射表自动展开。手抄这张表正是之前 portal 起不来、admin 不可用的原因。
+
+**密钥值的两条硬约束:**值里**不能有换行,也不能有 `$`** —— compose 的 `.env` 会对 `$` 做插值,
+静默损坏密钥。workflow 在 runner 上就会拦住并指名是哪一个。
 
 前八个是签名/加密密钥,**必须至少 32 字符**(`MIN_SIGNING_SECRET_LENGTH = 32`;不达标 core 启动时报
 `missing or insecure required core secrets`):
