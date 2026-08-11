@@ -1,0 +1,23 @@
+[Unit]
+Description=QM core
+Documentation=https://github.com/yc-software/qm
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=__DEPLOY_USER__
+WorkingDirectory=__REMOTE_DIR__
+EnvironmentFile=__REMOTE_DIR__/core.env
+ExecStart=__NODE_BIN__ src/index.ts
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qm-core
+
+[Install]
+WantedBy=multi-user.target

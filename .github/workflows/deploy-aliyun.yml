@@ -1,0 +1,326 @@
+name: Deploy to Aliyun ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-aliyun
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  LAYER: deploy/layers/qmcn
+  REMOTE_DIR: /opt/qm
+  SANDBOX_IMAGE: qm-sandbox-local:latest
+
+jobs:
+  deploy:
+    name: Build on host and bring up
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+
+      - name: Vendor the pi coding agent
+        run: bash "$LAYER/scripts/vendor-pi.sh"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck the layer script
+        run: npx tsc --noEmit --module nodenext --target es2023 --strict --allowImportingTsExtensions "$LAYER/scripts/render-compose.ts"
+
+      - name: Render docker-compose.yml
+        id: render
+        env:
+          QM_PUBLIC_URL: ${{ vars.QM_PUBLIC_URL }}
+          QM_AUTH_EMAIL_DOMAIN: ${{ vars.QM_AUTH_EMAIL_DOMAIN }}
+          QM_ADMIN_GRANTS: ${{ vars.QM_ADMIN_GRANTS }}
+          QM_REMOTE_DIR: ${{ env.REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          test -n "$QM_PUBLIC_URL" || { echo "::error::repository variable QM_PUBLIC_URL is not set"; exit 1; }
+          test -n "$QM_AUTH_EMAIL_DOMAIN" || { echo "::error::repository variable QM_AUTH_EMAIL_DOMAIN is not set"; exit 1; }
+          test -n "$QM_ADMIN_GRANTS" || { echo "::error::repository variable QM_ADMIN_GRANTS is not set"; exit 1; }
+          node "$LAYER/scripts/render-compose.ts" | tee /tmp/render.out
+          grep '^CORE_HOST_PORT=' /tmp/render.out >> "$GITHUB_OUTPUT"
+
+      - name: Show the rendered compose and secret map
+        run: |
+          set -euo pipefail
+          cat "$LAYER/docker-compose.yml"
+          echo "--- secret map (env name, source secret, requirement) ---"
+          cat "$LAYER/.generated/secret-map"
+
+      - name: Compute the sandbox image fingerprint
+        id: fingerprint
+        run: |
+          set -euo pipefail
+          fp="$(node --input-type=module -e '
+            const { computeSandboxImageFingerprint } = await import("./src/sandbox/local-sandbox.ts");
+            const fp = await computeSandboxImageFingerprint(process.cwd());
+            if (!fp) { console.error("cannot compute sandbox image fingerprint"); process.exit(1); }
+            console.log(fp);
+          ')"
+          echo "value=$fp" >> "$GITHUB_OUTPUT"
+
+      - name: Write the deployment .env
+        env:
+          CORE_SIGNING_SECRET: ${{ secrets.CORE_SIGNING_SECRET }}
+          CAPABILITY_SECRET: ${{ secrets.CAPABILITY_SECRET }}
+          PORTAL_IDENTITY_SECRET: ${{ secrets.PORTAL_IDENTITY_SECRET }}
+          CONNECTOR_SECRET_KEY: ${{ secrets.CONNECTOR_SECRET_KEY }}
+          SKILL_SIGNING_SECRET: ${{ secrets.SKILL_SIGNING_SECRET }}
+          PORTAL_SESSION_SECRET: ${{ secrets.PORTAL_SESSION_SECRET }}
+          AUTH_TOKEN_SECRET: ${{ secrets.AUTH_TOKEN_SECRET }}
+          AUTH_CLIENT_SECRET: ${{ secrets.AUTH_CLIENT_SECRET }}
+          AUTH_SIGNING_JWK: ${{ secrets.AUTH_SIGNING_JWK }}
+          AUTH_EMAIL_FROM: ${{ secrets.AUTH_EMAIL_FROM }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          PUBLIC_API_URL: ${{ secrets.PUBLIC_API_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : > "$LAYER/.env"
+          missing=()
+          weak=()
+          malformed=()
+          systemd_unsafe=()
+          strong=" CORE_SIGNING_SECRET CAPABILITY_SECRET PORTAL_IDENTITY_SECRET CONNECTOR_SECRET_KEY SKILL_SIGNING_SECRET PORTAL_SESSION_SECRET AUTH_TOKEN_SECRET AUTH_CLIENT_SECRET "
+          : > "$LAYER/.generated/core.secrets"
+          while IFS=$'\t' read -r envname source requirement services; do
+            value="${!source:-}"
+            if [[ -z "$value" ]]; then
+              [[ "$requirement" == "required" ]] && missing+=("$source")
+              continue
+            fi
+            if [[ "$value" == *$'\n'* || "$value" == *'$'* ]]; then
+              malformed+=("$source")
+              continue
+            fi
+            if [[ ",$services," == *",core,"* ]] && [[ "$value" == *'\'* || "$value" == [\'\"]* ]]; then
+              systemd_unsafe+=("$source")
+              continue
+            fi
+            if [[ "$strong" == *" $source "* ]] && (( ${#value} < 32 )); then
+              weak+=("$source")
+              continue
+            fi
+            if [[ ",$services," == *",core,"* ]]; then
+              printf '%s=%s\n' "$envname" "$value" >> "$LAYER/.generated/core.secrets"
+            fi
+            if [[ "$services" != "core" ]]; then
+              printf '%s=%s\n' "$envname" "$value" >> "$LAYER/.env"
+            fi
+          done < "$LAYER/.generated/secret-map"
+          if (( ${#missing[@]} )); then
+            echo "::error::missing required repository secrets: ${missing[*]}"
+          fi
+          if (( ${#weak[@]} )); then
+            echo "::error::shorter than the 32 characters core requires: ${weak[*]}"
+          fi
+          if (( ${#malformed[@]} )); then
+            echo "::error::these contain a newline or a '\$', which docker compose would corrupt: ${malformed[*]}"
+          fi
+          if (( ${#systemd_unsafe[@]} )); then
+            echo "::error::core reads these through a systemd EnvironmentFile, which unquotes and processes"
+            echo "::error::backslash escapes — a backslash or a leading quote is silently corrupted: ${systemd_unsafe[*]}"
+          fi
+          (( ${#missing[@]} + ${#weak[@]} + ${#malformed[@]} + ${#systemd_unsafe[@]} == 0 )) || exit 1
+          cat "$LAYER/.generated/core.env" "$LAYER/.generated/core.secrets" > "$LAYER/.generated/core.runtime.env"
+          rm -f "$LAYER/.generated/core.secrets"
+          echo "compose .env: $(wc -l < "$LAYER/.env") entries; core.env: $(wc -l < "$LAYER/.generated/core.runtime.env") entries"
+
+      - name: Open the SSH channel
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          HOST: ${{ secrets.HOST }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          USER_NAME: ${{ secrets.USER }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_KEY" || { echo "::error::secret SSH_KEY is not set"; exit 1; }
+          test -n "$HOST" || { echo "::error::secret HOST is not set"; exit 1; }
+          test -n "$USER_NAME" || { echo "::error::secret USER is not set"; exit 1; }
+          if [[ -z "$SSH_KNOWN_HOSTS" ]]; then
+            echo "::error::secret SSH_KNOWN_HOSTS is not set. All deployment secrets are copied to this host,"
+            echo "::error::so its key must be pinned rather than trusted on first sight."
+            echo "::error::Generate it once with: ssh-keyscan -H <host>"
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'SSHCONFIG'
+          Host deploy-target
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+          SSHCONFIG
+          chmod 600 ~/.ssh/config
+
+      - name: Fetch a pinned Node runtime for the host
+        run: |
+          set -euo pipefail
+          version="v$(tr -d '\n' < .node-version)"
+          curl -fsSL --retry 5 -o /tmp/node-host.tar.xz \
+            "https://nodejs.org/dist/$version/node-$version-linux-x64.tar.xz"
+          echo "fetched node $version for the host"
+
+      - name: Ship the tree
+        env:
+          HOST: ${{ secrets.HOST }}
+          USER_NAME: ${{ secrets.USER }}
+        run: |
+          set -euo pipefail
+          tar --exclude=./.git --exclude=./node_modules --exclude='./**/node_modules' \
+              --exclude="./$LAYER/.env" --exclude="./$LAYER/.generated" -czf /tmp/qm-tree.tgz .
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "set -eu; rm -rf '$REMOTE_DIR.incoming'; mkdir -p '$REMOTE_DIR.incoming'"
+          scp -o Hostname="$HOST" -o User="$USER_NAME" /tmp/qm-tree.tgz deploy-target:/tmp/qm-tree.tgz
+          scp -o Hostname="$HOST" -o User="$USER_NAME" /tmp/node-host.tar.xz deploy-target:/tmp/node-host.tar.xz
+          scp -o Hostname="$HOST" -o User="$USER_NAME" "$LAYER/.env" "deploy-target:$REMOTE_DIR.incoming.compose.env"
+          scp -o Hostname="$HOST" -o User="$USER_NAME" "$LAYER/.generated/core.runtime.env" "deploy-target:$REMOTE_DIR.incoming.core.env"
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "REMOTE_DIR='$REMOTE_DIR' LAYER='$LAYER' bash -s" <<'REMOTE'
+          set -euo pipefail
+          arch="$(uname -m)"
+          if [ "$arch" != "x86_64" ]; then
+            echo "host is $arch but the shipped Node build is linux-x64" >&2
+            exit 1
+          fi
+          tar -xzf /tmp/qm-tree.tgz -C "$REMOTE_DIR.incoming"
+          rm -f /tmp/qm-tree.tgz
+          install -m 600 "$REMOTE_DIR.incoming.compose.env" "$REMOTE_DIR.incoming/$LAYER/.env"
+          install -m 600 "$REMOTE_DIR.incoming.core.env" "$REMOTE_DIR.incoming/core.env"
+          rm -f "$REMOTE_DIR.incoming.compose.env" "$REMOTE_DIR.incoming.core.env"
+          sudo mkdir -p /opt/node
+          sudo tar -xJf /tmp/node-host.tar.xz -C /opt/node --strip-components=1
+          rm -f /tmp/node-host.tar.xz
+          sudo mkdir -p /opt/qm-data
+          sudo chown "$(id -u):$(id -g)" /opt/qm-data
+          if systemctl is-active --quiet qm-core; then sudo systemctl stop qm-core; fi
+          rm -rf "$REMOTE_DIR.previous"
+          if [ -d "$REMOTE_DIR" ]; then sudo mv "$REMOTE_DIR" "$REMOTE_DIR.previous"; fi
+          sudo mv "$REMOTE_DIR.incoming" "$REMOTE_DIR"
+          REMOTE
+
+      - name: Install core dependencies on the host
+        env:
+          HOST: ${{ secrets.HOST }}
+          USER_NAME: ${{ secrets.USER }}
+          NPM_REGISTRY: ${{ vars.NPM_REGISTRY || 'https://registry.npmmirror.com' }}
+        run: |
+          set -euo pipefail
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "REMOTE_DIR='$REMOTE_DIR' NPM_REGISTRY='$NPM_REGISTRY' bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PATH=/opt/node/bin:$PATH
+          cd "$REMOTE_DIR"
+          npm ci --omit=dev --no-audit --no-fund --registry "$NPM_REGISTRY"
+          node --version
+          REMOTE
+
+      - name: Build the agent sandbox image
+        env:
+          HOST: ${{ secrets.HOST }}
+          USER_NAME: ${{ secrets.USER }}
+          FINGERPRINT: ${{ steps.fingerprint.outputs.value }}
+        run: |
+          set -euo pipefail
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "REMOTE_DIR='$REMOTE_DIR' FINGERPRINT='$FINGERPRINT' SANDBOX_IMAGE='$SANDBOX_IMAGE' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$REMOTE_DIR"
+          docker build --platform linux/amd64 -f fly/Dockerfile -t qm-sandbox-base:dev .
+          docker build --platform linux/amd64 -f local/Dockerfile \
+            --build-arg BASE=qm-sandbox-base:dev \
+            --label "qm.sandbox-fingerprint=$FINGERPRINT" \
+            -t "$SANDBOX_IMAGE" .
+          REMOTE
+
+      - name: Restart core and bring up the surfaces
+        env:
+          HOST: ${{ secrets.HOST }}
+          USER_NAME: ${{ secrets.USER }}
+        run: |
+          set -euo pipefail
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "REMOTE_DIR='$REMOTE_DIR' LAYER='$LAYER' DEPLOY_USER='$USER_NAME' bash -s" <<'REMOTE'
+          set -euo pipefail
+          sed -e "s|__DEPLOY_USER__|$DEPLOY_USER|g" \
+              -e "s|__REMOTE_DIR__|$REMOTE_DIR|g" \
+              -e "s|__NODE_BIN__|/opt/node/bin/node|g" \
+              "$REMOTE_DIR/$LAYER/qm-core.service.template" > /tmp/qm-core.service
+          sudo install -m 644 /tmp/qm-core.service /etc/systemd/system/qm-core.service
+          rm -f /tmp/qm-core.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable qm-core
+          sudo systemctl start qm-core
+          cd "$REMOTE_DIR/$LAYER"
+          docker compose build
+          docker compose up -d --remove-orphans
+          REMOTE
+
+      - name: Gate on core and every surface
+        env:
+          HOST: ${{ secrets.HOST }}
+          USER_NAME: ${{ secrets.USER }}
+          CORE_HOST_PORT: ${{ steps.render.outputs.CORE_HOST_PORT }}
+        run: |
+          set -euo pipefail
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "REMOTE_DIR='$REMOTE_DIR' LAYER='$LAYER' CORE_HOST_PORT='$CORE_HOST_PORT' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$REMOTE_DIR/$LAYER"
+          healthy=""
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 5 "http://127.0.0.1:$CORE_HOST_PORT/healthz" >/dev/null; then
+              healthy="$attempt"
+              break
+            fi
+            sleep 4
+          done
+          if [ -z "$healthy" ]; then
+            echo "core never answered /healthz on port $CORE_HOST_PORT" >&2
+            sudo journalctl -u qm-core -n 80 --no-pager >&2 || true
+            exit 1
+          fi
+          echo "core healthy after $healthy attempt(s)"
+          sleep 5
+          stopped="$(docker compose ps -a --format '{{.Service}} {{.State}}' | awk '$2 != "running" {print $1}')"
+          if [ -n "$stopped" ]; then
+            echo "these surfaces are not running: $stopped" >&2
+            for svc in $stopped; do
+              echo "--- $svc ---" >&2
+              docker compose logs --tail 40 "$svc" >&2
+            done
+            exit 1
+          fi
+          docker compose ps -a
+          REMOTE
+
+      - name: Scrub the runner
+        if: always()
+        run: rm -f "$LAYER/.env" "$LAYER/.generated/core.runtime.env" ~/.ssh/id_deploy /tmp/qm-tree.tgz /tmp/node-host.tar.xz

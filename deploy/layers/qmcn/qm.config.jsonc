@@ -1,0 +1,57 @@
+{
+  // The deployment contract major this directory conforms to.
+  "contract": 1,
+
+  // Short identifier for your organization; app and container names derive from it.
+  "orgId": "qmcn",
+
+  // The one public address of the deployment; the service URLs derive from it.
+  "publicUrl": "https://qm.REPLACE-WITH-YOUR-DOMAIN.example",
+
+  // Where to deploy: "docker" runs local containers, "fly" deploys Fly apps,
+  // and "aws" runs the control plane on ECS and agent computers on Lambda MicroVMs.
+  "target": "docker",
+
+  // No "modelProvider": the built-in vendors are unreachable from mainland China, so
+  // no vendor API key is a required deployment secret. An org admin registers a
+  // custom OpenAI-compatible provider from the Admin page after deploy.
+
+  // First-party services to run. The full set: "core" (the agent runtime and API,
+  // always required), "slack" (the Slack surface, runs inside the core process),
+  // "web-ui" (a browser chat UI), "admin" (the operator dashboard), "portal"
+  // (the public sign-in front door), and "auth" (the built-in sign-in broker that
+  // emails one-time links; drop it to sign in through an external OIDC provider).
+  "services": ["core", "web-ui", "admin", "portal", "auth"],
+
+  // Extra plugins to run alongside the services. A prebuilt image runs with
+  // { "name": "linear", "image": "ghcr.io/you/qm-linear:1.0" }. A plugin with a
+  // Dockerfile at plugins/<name>/ in this directory needs no entry here at all.
+  "plugins": [],
+
+  // Extra directories of SKILL.md files, mounted into the agent.
+  "skills": [],
+
+  // Non-secret env overrides, per service. HARNESS "pi" runs real agent turns
+  // against the base model selected by "modelProvider" above. "mock" runs the
+  // whole stack with fake turns and no model calls.
+  "env": {
+    "core": {
+      "HARNESS": "pi",
+      "NODE_ENV": "production",
+      "SANDBOX_BACKEND": "local",
+      "SESSION_STORE": "postgres",
+      "RUN_STORE": "postgres",
+      "ARTIFACT_STORE": "postgres",
+      "HARNESS_SECURITY_POSTURE": "auto",
+    },
+    "admin": {
+      "ADMIN_BASE_PATH": "/admin",
+    },
+    "auth": {
+      "AUTH_EMAIL_TRANSPORT": "smtp",
+      "AUTH_ALLOWED_EMAIL_DOMAIN": "REPLACE-WITH-YOUR-EMAIL-DOMAIN.example",
+      "SMTP_PORT": "465",
+      "SMTP_TLS": "implicit",
+    },
+  },
+}
