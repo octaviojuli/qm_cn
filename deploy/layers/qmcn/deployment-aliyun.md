@@ -200,7 +200,7 @@ core 日志(`journalctl -u qm-core`)出现
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz
-docker compose exec core node -e 'console.log(process.env.SANDBOX_BACKEND)'
+systemctl is-active qm-core && sudo systemctl show qm-core -p Environment | tr ' ' '\n' | grep SANDBOX_BACKEND
 psql "$DATABASE_URL" -c "\dt" | head -20
 ```
 
@@ -218,10 +218,10 @@ psql "$DATABASE_URL" -c "\dt" | head -20
 
 这套形态相比 AWS microVM 形态有三处实质降级,**上线前需要明确接受**:
 
-1. **core 容器挂载了 `/var/run/docker.sock`。** `local-sandbox.ts` 是通过 `docker run` 创建沙箱的,
-   所以 core 必须能访问 Docker daemon。这等于**core 容器拥有 ECS 主机的 root 等价权限** ——
-   一旦 core 被攻破,主机即失守。缓解方向:改用 rootless Docker,或在 core 与 daemon 之间放一个
-   socket 代理只放行必需的 API。这是本形态最重的一条,不要忽略。
+1. **core 以 docker 组成员的身份跑在宿主上。** `local-sandbox.ts` 通过 `docker` 创建沙箱,
+   所以 core 必须能用 Docker daemon。**能用 docker 就等价于宿主 root** —— 一旦 core 被攻破,主机即失守。
+   缓解方向:rootless Docker,或在 core 与 daemon 之间放一个 socket 代理只放行必需的 API。
+   这是本形态最重的一条,不要忽略。
 2. **出网强制完全失效。** `local-sandbox.ts` 的 profile 把 `egressEnforcement` 硬编码为 `"none"`,
    而 Envoy 出网代理只接在 sprites 路径上。`EgressPolicy` 在这里只是一份文档。
    补偿做法:把出网管控下移到**安全组与 VPC 路由** —— 沙箱容器放独立网段,默认拒绝出网,

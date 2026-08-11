@@ -64,3 +64,13 @@ Run every command from this directory.
 
 `npm exec qm -- help` lists everything else, including `sandbox build` and
 `rollback`.
+
+## 本层的实际部署方式
+
+**不要用 `qm check` / `qm plan` / `qm up`。** 上面那套流程属于 CLI 的 fly / aws / docker 三个目标,
+它们都要求一个 Fly agent-computer app,而本层是自托管形态(core 上宿主 + 本机 Docker 沙箱),
+CLI 的配置语言表达不了。
+
+实际入口是 `.github/workflows/deploy-aliyun.yml`,细节见 `deployment-aliyun.md`。
+`package.json` 里的 `@yc-software/qm` 依赖只是 `qm init` 的脚手架残留;
+`scripts/render-compose.ts` 直接从 `cli/src/*.ts` 导入,不走这个包。

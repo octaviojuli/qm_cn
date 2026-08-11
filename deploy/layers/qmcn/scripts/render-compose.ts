@@ -50,7 +50,9 @@ if (!adminGrants) {
   );
 }
 
+const ADMIN_GRANTS: string = adminGrants;
 const REMOTE_DIR = process.env.QM_REMOTE_DIR?.trim() || "/opt/qm";
+const DATA_DIR = process.env.QM_DATA_DIR?.trim() || "/opt/qm-data";
 const LAYER_REL = "deploy/layers/qmcn";
 const basePort = dockerBasePort(config);
 const CORE_PORT = basePort + (serviceDef("core").docker.hostPortOffset ?? 0);
@@ -91,14 +93,14 @@ function coreEnv(): Record<string, string> {
   return {
     ...orgEnv("core", config.orgId, config.publicUrl, config.services.includes("portal")),
     PORT: String(CORE_PORT),
-    DATA_DIR: `${REMOTE_DIR}/data`,
+    DATA_DIR,
     SESSION_STORE: "postgres",
     RUN_STORE: "postgres",
     ...SELF_HOSTED_CORE_ENV,
     ...(layerMounts.length ? { DEPLOYMENT_LAYER: `${REMOTE_DIR}/${LAYER_REL}/sandbox` } : {}),
     ...(config.model ? { PI_MODEL: config.model } : {}),
     ...(config.modelProvider ? { MODEL_PROVIDER: config.modelProvider } : {}),
-    ADMIN_GRANTS: adminGrants,
+    ADMIN_GRANTS,
     ...securityScreenEnv(config),
     ...virtualServiceEnv(config.services, config.env),
     ...(config.env.core ?? {}),

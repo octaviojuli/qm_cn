@@ -40,6 +40,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Typecheck the layer script
+        run: npx tsc --noEmit --module nodenext --target es2023 --strict --allowImportingTsExtensions "$LAYER/scripts/render-compose.ts"
+
       - name: Render docker-compose.yml
         id: render
         env:
@@ -100,6 +103,7 @@ jobs:
           missing=()
           weak=()
           malformed=()
+          systemd_unsafe=()
           strong=" CORE_SIGNING_SECRET CAPABILITY_SECRET PORTAL_IDENTITY_SECRET CONNECTOR_SECRET_KEY SKILL_SIGNING_SECRET PORTAL_SESSION_SECRET AUTH_TOKEN_SECRET AUTH_CLIENT_SECRET "
           : > "$LAYER/.generated/core.secrets"
           while IFS=$'\t' read -r envname source requirement services; do
@@ -110,6 +114,10 @@ jobs:
             fi
             if [[ "$value" == *$'\n'* || "$value" == *'$'* ]]; then
               malformed+=("$source")
+              continue
+            fi
+            if [[ ",$services," == *",core,"* ]] && [[ "$value" == *'\'* || "$value" == [\'\"]* ]]; then
+              systemd_unsafe+=("$source")
               continue
             fi
             if [[ "$strong" == *" $source "* ]] && (( ${#value} < 32 )); then
@@ -132,7 +140,11 @@ jobs:
           if (( ${#malformed[@]} )); then
             echo "::error::these contain a newline or a '\$', which docker compose would corrupt: ${malformed[*]}"
           fi
-          (( ${#missing[@]} + ${#weak[@]} + ${#malformed[@]} == 0 )) || exit 1
+          if (( ${#systemd_unsafe[@]} )); then
+            echo "::error::core reads these through a systemd EnvironmentFile, which unquotes and processes"
+            echo "::error::backslash escapes — a backslash or a leading quote is silently corrupted: ${systemd_unsafe[*]}"
+          fi
+          (( ${#missing[@]} + ${#weak[@]} + ${#malformed[@]} + ${#systemd_unsafe[@]} == 0 )) || exit 1
           cat "$LAYER/.generated/core.env" "$LAYER/.generated/core.secrets" > "$LAYER/.generated/core.runtime.env"
           rm -f "$LAYER/.generated/core.secrets"
           echo "compose .env: $(wc -l < "$LAYER/.env") entries; core.env: $(wc -l < "$LAYER/.generated/core.runtime.env") entries"
@@ -142,10 +154,12 @@ jobs:
           SSH_KEY: ${{ secrets.SSH_KEY }}
           HOST: ${{ secrets.HOST }}
           SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          USER_NAME: ${{ secrets.USER }}
         run: |
           set -euo pipefail
           test -n "$SSH_KEY" || { echo "::error::secret SSH_KEY is not set"; exit 1; }
           test -n "$HOST" || { echo "::error::secret HOST is not set"; exit 1; }
+          test -n "$USER_NAME" || { echo "::error::secret USER is not set"; exit 1; }
           if [[ -z "$SSH_KNOWN_HOSTS" ]]; then
             echo "::error::secret SSH_KNOWN_HOSTS is not set. All deployment secrets are copied to this host,"
             echo "::error::so its key must be pinned rather than trusted on first sight."
@@ -204,7 +218,9 @@ jobs:
           sudo mkdir -p /opt/node
           sudo tar -xJf /tmp/node-host.tar.xz -C /opt/node --strip-components=1
           rm -f /tmp/node-host.tar.xz
-          if [ -d "$REMOTE_DIR/data" ]; then cp -a "$REMOTE_DIR/data" "$REMOTE_DIR.incoming/data"; fi
+          sudo mkdir -p /opt/qm-data
+          sudo chown "$(id -u):$(id -g)" /opt/qm-data
+          if systemctl is-active --quiet qm-core; then sudo systemctl stop qm-core; fi
           rm -rf "$REMOTE_DIR.previous"
           if [ -d "$REMOTE_DIR" ]; then sudo mv "$REMOTE_DIR" "$REMOTE_DIR.previous"; fi
           sudo mv "$REMOTE_DIR.incoming" "$REMOTE_DIR"
@@ -261,7 +277,7 @@ jobs:
           rm -f /tmp/qm-core.service
           sudo systemctl daemon-reload
           sudo systemctl enable qm-core
-          sudo systemctl restart qm-core
+          sudo systemctl start qm-core
           cd "$REMOTE_DIR/$LAYER"
           docker compose build
           docker compose up -d --remove-orphans
