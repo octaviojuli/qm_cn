@@ -11,6 +11,7 @@
   "workspaces": {
     ".": {
       "entry": [
+        "deploy/layers/*/scripts/*.ts",
         "src/sandbox/local-sandbox.ts",
         "scripts/aws-deploy-smoke.ts",
         "scripts/aws-litestream-smoke.ts",

@@ -202,6 +202,7 @@ psql "$DATABASE_URL" -c "\dt" | head -20
 | 文件                                  | 偏离                                                          | 原因                                           |
 | ------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------- |
 | `.github/workflows/deploy-aliyun.yml` | 新增                                                          | 上游明确不带生产部署 workflow;CI 目录属于 core |
+| `knip.json`                           | `.` workspace 的 entry 增加 `deploy/layers/*/scripts/*.ts`    | 否则 `render-compose.ts` 被判死文件,lint 失败  |
 | `package.json`                        | `@earendil-works/pi-coding-agent` 由 URL 改为 `file:vendor/…` | GitHub Release tarball 在国内拉取不稳          |
 | `package-lock.json`                   | 随上一条重算                                                  | 同上                                           |
 | `vendor/*.tgz`                        | 新增                                                          | 被 vendor 的依赖本体                           |
