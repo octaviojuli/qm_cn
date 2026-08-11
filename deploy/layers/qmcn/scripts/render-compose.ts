@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { dockerBasePort, loadConfigAt } from "../../../../cli/src/config.ts";
+import { dockerBasePort, loadConfigAt, securityScreenEnv } from "../../../../cli/src/config.ts";
 import { dockerServiceEnv } from "../../../../cli/src/backends/docker.ts";
 import { orgEnv, runnableServices, serviceDef, virtualServiceEnv } from "../../../../cli/src/services.ts";
 import { computedSecrets, secretDestinations } from "../../../../cli/src/secrets.ts";
@@ -10,7 +10,18 @@ const layerDir = resolve(dirname(new URL(import.meta.url).pathname), "..");
 const { config } = loadConfigAt(join(layerDir, "qm.config.jsonc"));
 
 const publicUrlOverride = process.env.QM_PUBLIC_URL?.trim();
-if (publicUrlOverride) config.publicUrl = publicUrlOverride.replace(/\/$/, "");
+if (publicUrlOverride) {
+  let parsed: URL;
+  try {
+    parsed = new URL(publicUrlOverride);
+  } catch {
+    throw new Error(`QM_PUBLIC_URL is not a valid URL: ${publicUrlOverride}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`QM_PUBLIC_URL must be an http(s) URL, got ${parsed.protocol}//`);
+  }
+  config.publicUrl = publicUrlOverride.replace(/\/$/, "");
+}
 
 const emailDomainOverride = process.env.QM_AUTH_EMAIL_DOMAIN?.trim();
 if (emailDomainOverride) {
@@ -31,8 +42,21 @@ if (config.publicUrl.includes("REPLACE-WITH")) {
   throw new Error(`publicUrl still holds a placeholder: ${config.publicUrl} (set QM_PUBLIC_URL)`);
 }
 
-const services = runnableServices(config.services);
+const adminGrants = process.env.QM_ADMIN_GRANTS?.trim();
+if (!adminGrants) {
+  throw new Error(
+    "QM_ADMIN_GRANTS is required: with Postgres, an unset ADMIN_GRANTS seeds zero org admins, " +
+      "and registering a model provider from the Admin page is then impossible",
+  );
+}
+
+const REMOTE_DIR = process.env.QM_REMOTE_DIR?.trim() || "/opt/qm";
+const LAYER_REL = "deploy/layers/qmcn";
 const basePort = dockerBasePort(config);
+const CORE_PORT = basePort + (serviceDef("core").docker.hostPortOffset ?? 0);
+
+const allServices = runnableServices(config.services);
+const containerServices = allServices.filter((s) => s !== "core");
 
 interface SecretSlot {
   env: string;
@@ -57,7 +81,7 @@ const layerMounts = (["skills", "tools"] as const).filter((sub) => existsSync(jo
 
 const SELF_HOSTED_CORE_ENV: Record<string, string> = {
   SANDBOX_BACKEND: "local",
-  LOCAL_SANDBOX_IMAGE: "${LOCAL_SANDBOX_IMAGE:-qm-sandbox-local:latest}",
+  LOCAL_SANDBOX_IMAGE: "qm-sandbox-local:latest",
   ARTIFACT_STORE: "postgres",
   SNAPSHOT_STORE: "local",
   TRANSFER_STORE: "local",
@@ -66,12 +90,16 @@ const SELF_HOSTED_CORE_ENV: Record<string, string> = {
 function coreEnv(): Record<string, string> {
   return {
     ...orgEnv("core", config.orgId, config.publicUrl, config.services.includes("portal")),
-    PORT: String(serviceDef("core").docker.internalPort),
-    DATA_DIR: "/data",
+    PORT: String(CORE_PORT),
+    DATA_DIR: `${REMOTE_DIR}/data`,
     SESSION_STORE: "postgres",
     RUN_STORE: "postgres",
     ...SELF_HOSTED_CORE_ENV,
-    ...(layerMounts.length ? { DEPLOYMENT_LAYER: "/layer" } : {}),
+    ...(layerMounts.length ? { DEPLOYMENT_LAYER: `${REMOTE_DIR}/${LAYER_REL}/sandbox` } : {}),
+    ...(config.model ? { PI_MODEL: config.model } : {}),
+    ...(config.modelProvider ? { MODEL_PROVIDER: config.modelProvider } : {}),
+    ADMIN_GRANTS: adminGrants,
+    ...securityScreenEnv(config),
     ...virtualServiceEnv(config.services, config.env),
     ...(config.env.core ?? {}),
   };
@@ -86,10 +114,13 @@ function envBlock(env: Record<string, string>, secrets: SecretSlot[], indent: st
 }
 
 const blocks: string[] = [];
-for (const service of services) {
-  const isCore = service === "core";
+for (const service of containerServices) {
   const def = serviceDef(service);
-  const env = isCore ? coreEnv() : { ...dockerServiceEnv(config, service), ...(config.env[service] ?? {}) };
+  const env = {
+    ...dockerServiceEnv(config, service),
+    CORE_API_URL: `http://host.docker.internal:${CORE_PORT}`,
+    ...(config.env[service] ?? {}),
+  };
   const block: string[] = [
     `  ${service}:`,
     `    image: qm-${service}:local`,
@@ -104,14 +135,7 @@ for (const service of services) {
   if (def.docker.hostPortOffset !== undefined) {
     block.push(`    ports: ["127.0.0.1:${basePort + def.docker.hostPortOffset}:${def.docker.internalPort}"]`);
   }
-  if (isCore) {
-    block.push(`    volumes:`);
-    block.push(`      - coredata:/data`);
-    block.push(`      - /var/run/docker.sock:/var/run/docker.sock`);
-    for (const sub of layerMounts) block.push(`      - ./sandbox/${sub}:/layer/${sub}:ro`);
-  } else {
-    block.push(`    depends_on: [core]`);
-  }
+  block.push(`    extra_hosts: ["host.docker.internal:host-gateway"]`);
   blocks.push(block.join("\n"));
 }
 
@@ -121,27 +145,36 @@ networks:
   qm:
     name: ${config.orgId}
 
-volumes:
-  coredata:
-
 services:
 ${blocks.join("\n\n")}
 `;
 
 writeFileSync(join(layerDir, "docker-compose.yml"), compose);
 
-const slots = new Map<string, SecretSlot>();
-for (const service of services) {
-  for (const slot of secretSlotsFor(service)) slots.set(slot.env, slot);
+const slots = new Map<string, SecretSlot & { services: Set<string> }>();
+for (const service of allServices) {
+  for (const slot of secretSlotsFor(service)) {
+    const existing = slots.get(slot.env);
+    if (existing) existing.services.add(service);
+    else slots.set(slot.env, { ...slot, services: new Set([service]) });
+  }
 }
 const manifest = [...slots.values()]
   .sort((a, b) => a.env.localeCompare(b.env))
-  .map((slot) => `${slot.env}\t${slot.source}\t${slot.required ? "required" : "optional"}`)
+  .map(
+    (slot) =>
+      `${slot.env}\t${slot.source}\t${slot.required ? "required" : "optional"}\t${[...slot.services].sort().join(",")}`,
+  )
   .join("\n");
 mkdirSync(join(layerDir, ".generated"), { recursive: true });
 writeFileSync(join(layerDir, ".generated", "secret-map"), `${manifest}\n`);
 
-const corePort = basePort + (serviceDef("core").docker.hostPortOffset ?? 0);
-process.stdout.write(`wrote docker-compose.yml (${services.length} services)\n`);
+const coreEnvFile = Object.entries(coreEnv())
+  .map(([k, v]) => `${k}=${v}`)
+  .join("\n");
+writeFileSync(join(layerDir, ".generated", "core.env"), `${coreEnvFile}\n`);
+
+process.stdout.write(`wrote docker-compose.yml (${containerServices.length} container services)\n`);
+process.stdout.write(`wrote .generated/core.env (core runs on the host)\n`);
 process.stdout.write(`wrote .generated/secret-map (${slots.size} env slots)\n`);
-process.stdout.write(`CORE_HOST_PORT=${corePort}\n`);
+process.stdout.write(`CORE_HOST_PORT=${CORE_PORT}\n`);

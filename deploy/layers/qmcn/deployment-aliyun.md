@@ -1,8 +1,15 @@
 # 阿里云 ECS 自托管部署手册
 
-这份手册部署的形态是:**控制面五个容器跑在一台 ECS 上,agent 沙箱用本机 Docker(`SANDBOX_BACKEND=local`),
-状态落阿里云 RDS PostgreSQL,镜像在主机本地构建。** 不接 OSS,不接 ACR,不接 Slack,不接任何境外模型厂商。
-部署由 GitHub Actions 通过 SSH 推,平时不需要登录 ECS。
+这份手册部署的形态是:**core 由 systemd 直接跑在 ECS 宿主上,四个界面(web-ui / admin / portal / auth)
+跑在容器里,agent 沙箱用本机 Docker(`SANDBOX_BACKEND=local`),状态落阿里云 RDS PostgreSQL。**
+不接 OSS,不接 ACR,不接 Slack,不接任何境外模型厂商。部署由 GitHub Actions 通过 SSH 推,平时不需要登录 ECS。
+
+**为什么 core 不进容器** —— 这是被评审拦下来才发现的。`local-sandbox.ts` 把沙箱端口发布在
+**宿主的** `127.0.0.1`(`127.0.0.1:0:AGENT_PORT`),再用 `http://127.0.0.1:<port>` 拨回去。
+core 一旦进了容器,那个 loopback 就是它自己的网络命名空间,**每一次 agent 轮次都连不上沙箱**。
+挂 `docker.sock` 也不解决:core 镜像里没有 docker 客户端,而且以 `USER node` 运行。
+`SANDBOX_BACKEND=local` 从设计上就假定 core 与 Docker daemon 同在一台宿主 —— 它是给开发机
+`npm run dev` 用的,把它当成容器化自托管方案是错的。
 
 ## 为什么不用 `qm up`
 
@@ -36,9 +43,16 @@ QM 自带的 CLI 有三个部署目标(`docker` / `fly` / `aws`),但**没有一�
 | 邮件推送 DirectMail | 一个发信域名                        | 登录链接靠它发。也可用任意支持 TLS 的 SMTP                                                                   |
 | 模型服务            | 百炼 / DashScope 等 OpenAI 兼容端点 | 部署后在 Admin 页注册为自定义 provider                                                                       |
 
-ECS 主机上只需要三样:**Docker(含 compose 插件)、sshd、`curl`**。不需要 Node,不需要 git ——
-需要 Node 的步骤全部在 GitHub runner 上完成。部署账号要能免密 `docker`(在 `docker` 组里),
-并对 `/opt/qm` 有写权限。
+ECS 主机上需要:**Docker(含 compose 插件)、sshd、`curl`、`sudo`**,架构必须是 **x86_64**
+(workflow 送过去的 Node 是 linux-x64 构建,不匹配会直接报错退出)。不需要预装 Node,也不需要 git。
+
+部署账号要求:在 `docker` 组里(免密 `docker`)、能**免密 sudo**(装 systemd 单元、写 `/opt/node`)、
+对 **`/opt`** 有写权限(不只是 `/opt/qm` —— 部署过程会创建 `/opt/qm.incoming`、`/opt/qm.previous` 并改名)。
+
+需要 sudo 这件事不额外放大风险:**能用 docker 就已经等价于宿主 root 了**。
+
+宿主还需要能访问一个 npm 源(默认走 `https://registry.npmmirror.com`,可用仓库变量 `NPM_REGISTRY` 覆盖)
+—— core 的生产依赖约 2 GB,在宿主上装比从 runner 传过去现实得多。
 
 ## 部署方式:GitHub Actions 推,主机构建
 
@@ -112,8 +126,12 @@ node -e "const {generateKeyPairSync}=require('node:crypto');process.stdout.write
 
 **Variables**(同一页面的 Variables 标签,非密钥):
 
-- `QM_PUBLIC_URL` —— 部署的公网地址,例如 `https://qm.example.com`
+- `QM_PUBLIC_URL` —— 部署的公网地址,例如 `https://qm.example.com`(校验必须是 http/https URL)
 - `QM_AUTH_EMAIL_DOMAIN` —— 允许登录的邮箱域名
+- `QM_ADMIN_GRANTS` —— **初始组织管理员**,逗号分隔的邮箱。用了 Postgres 之后,
+  `ADMIN_GRANTS` 不设会让 `bootAdminGrantSeed` 播下**零个**管理员 —— 那就进不了 Admin 页,
+  也就无法注册国产模型 provider,整个部署没有可用模型。`render-compose.ts` 缺它直接报错。
+- `NPM_REGISTRY`(可选)—— 宿主装依赖用的 npm 源,默认 `https://registry.npmmirror.com`
 
 这两项以变量而非提交值的形式存在,是为了让 `qm.config.jsonc` 留在仓库里当模板。
 `render-compose.ts` 有占位符守卫:两者任一未注入就直接报错,不会渲染出一份带
@@ -129,32 +147,40 @@ Actions → Deploy to Aliyun ECS → Run workflow。`ref` 输入可留空(用当
 
 ### 手动兜底
 
-主机上装了 Node ≥ 24 的话,同一套东西可以手工跑:
+不要手抄密钥清单 —— 先渲染,再照生成的映射表填:
 
 ```bash
-cp deploy/layers/qmcn/.env.aliyun.example deploy/layers/qmcn/.env   # 填值
 bash deploy/layers/qmcn/scripts/vendor-pi.sh
 QM_PUBLIC_URL=https://qm.example.com QM_AUTH_EMAIL_DOMAIN=example.com \
-  node deploy/layers/qmcn/scripts/render-compose.ts
-bash scripts/local-sandbox-build.sh
-cd deploy/layers/qmcn && docker compose up -d --build
+  QM_ADMIN_GRANTS=you@example.com node deploy/layers/qmcn/scripts/render-compose.ts
+cat deploy/layers/qmcn/.generated/secret-map      # 第 4 列是归属:core 还是界面服务
 ```
 
-core 日志出现 `[qm] listening on :8080 (org=qmcn, store=postgres, runStore=postgres, ...)` 即为正常。
+`core` 那部分的值追加进 `.generated/core.env` 交给 systemd;其余写进 `deploy/layers/qmcn/.env` 给 compose。
+然后 `npm ci --omit=dev`、`bash scripts/local-sandbox-build.sh`、起 systemd 单元、
+`cd deploy/layers/qmcn && docker compose up -d --build`。
+
+core 日志(`journalctl -u qm-core`)出现
+`[qm] listening on :8080 (org=qmcn, store=postgres, runStore=postgres, ...)` 即为正常。
 
 ### 端口
 
 全部只绑 `127.0.0.1`,由 SLB 或本机 Nginx 反代出去:
 
-| 服务   | 本机端口     |
-| ------ | ------------ |
-| core   | 8080         |
-| portal | 8081         |
-| web-ui | 8082         |
-| admin  | 8083         |
-| auth   | 仅容器网络内 |
+| 服务   | 本机端口     | 形态         |
+| ------ | ------------ | ------------ |
+| core   | 8080         | systemd,宿主 |
+| portal | 8081         | 容器         |
+| web-ui | 8082         | 容器         |
+| admin  | 8083         | 容器         |
+| auth   | 仅容器网络内 | 容器         |
 
 对外只需暴露 **portal**(8081) —— 它按路径前缀反代 web-ui、admin 与 auth。
+
+界面容器通过 `host.docker.internal`(配了 `extra_hosts: host-gateway`)回连宿主上的 core。
+
+⚠️ **core 监听 0.0.0.0** —— `server.listen(port)` 不带绑定地址。容器要能连到它,就不能只绑 loopback,
+所以**必须用安全组把 8080 挡在公网之外**。这是本形态里唯一一处依赖基础设施兜底的端口。
 
 ## 部署后:注册模型 provider
 

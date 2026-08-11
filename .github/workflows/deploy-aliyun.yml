@@ -45,10 +45,13 @@ jobs:
         env:
           QM_PUBLIC_URL: ${{ vars.QM_PUBLIC_URL }}
           QM_AUTH_EMAIL_DOMAIN: ${{ vars.QM_AUTH_EMAIL_DOMAIN }}
+          QM_ADMIN_GRANTS: ${{ vars.QM_ADMIN_GRANTS }}
+          QM_REMOTE_DIR: ${{ env.REMOTE_DIR }}
         run: |
           set -euo pipefail
           test -n "$QM_PUBLIC_URL" || { echo "::error::repository variable QM_PUBLIC_URL is not set"; exit 1; }
           test -n "$QM_AUTH_EMAIL_DOMAIN" || { echo "::error::repository variable QM_AUTH_EMAIL_DOMAIN is not set"; exit 1; }
+          test -n "$QM_ADMIN_GRANTS" || { echo "::error::repository variable QM_ADMIN_GRANTS is not set"; exit 1; }
           node "$LAYER/scripts/render-compose.ts" | tee /tmp/render.out
           grep '^CORE_HOST_PORT=' /tmp/render.out >> "$GITHUB_OUTPUT"
 
@@ -98,7 +101,8 @@ jobs:
           weak=()
           malformed=()
           strong=" CORE_SIGNING_SECRET CAPABILITY_SECRET PORTAL_IDENTITY_SECRET CONNECTOR_SECRET_KEY SKILL_SIGNING_SECRET PORTAL_SESSION_SECRET AUTH_TOKEN_SECRET AUTH_CLIENT_SECRET "
-          while IFS=$'\t' read -r envname source requirement; do
+          : > "$LAYER/.generated/core.secrets"
+          while IFS=$'\t' read -r envname source requirement services; do
             value="${!source:-}"
             if [[ -z "$value" ]]; then
               [[ "$requirement" == "required" ]] && missing+=("$source")
@@ -112,7 +116,12 @@ jobs:
               weak+=("$source")
               continue
             fi
-            printf '%s=%s\n' "$envname" "$value" >> "$LAYER/.env"
+            if [[ ",$services," == *",core,"* ]]; then
+              printf '%s=%s\n' "$envname" "$value" >> "$LAYER/.generated/core.secrets"
+            fi
+            if [[ "$services" != "core" ]]; then
+              printf '%s=%s\n' "$envname" "$value" >> "$LAYER/.env"
+            fi
           done < "$LAYER/.generated/secret-map"
           if (( ${#missing[@]} )); then
             echo "::error::missing required repository secrets: ${missing[*]}"
@@ -124,8 +133,9 @@ jobs:
             echo "::error::these contain a newline or a '\$', which docker compose would corrupt: ${malformed[*]}"
           fi
           (( ${#missing[@]} + ${#weak[@]} + ${#malformed[@]} == 0 )) || exit 1
-          printf 'LOCAL_SANDBOX_IMAGE=%s\n' "$SANDBOX_IMAGE" >> "$LAYER/.env"
-          echo "wrote $(wc -l < "$LAYER/.env") entries"
+          cat "$LAYER/.generated/core.env" "$LAYER/.generated/core.secrets" > "$LAYER/.generated/core.runtime.env"
+          rm -f "$LAYER/.generated/core.secrets"
+          echo "compose .env: $(wc -l < "$LAYER/.env") entries; core.env: $(wc -l < "$LAYER/.generated/core.runtime.env") entries"
 
       - name: Open the SSH channel
         env:
@@ -156,6 +166,14 @@ jobs:
           SSHCONFIG
           chmod 600 ~/.ssh/config
 
+      - name: Fetch a pinned Node runtime for the host
+        run: |
+          set -euo pipefail
+          version="v$(tr -d '\n' < .node-version)"
+          curl -fsSL --retry 5 -o /tmp/node-host.tar.xz \
+            "https://nodejs.org/dist/$version/node-$version-linux-x64.tar.xz"
+          echo "fetched node $version for the host"
+
       - name: Ship the tree
         env:
           HOST: ${{ secrets.HOST }}
@@ -163,21 +181,49 @@ jobs:
         run: |
           set -euo pipefail
           tar --exclude=./.git --exclude=./node_modules --exclude='./**/node_modules' \
-              --exclude="./$LAYER/.env" -czf /tmp/qm-tree.tgz .
+              --exclude="./$LAYER/.env" --exclude="./$LAYER/.generated" -czf /tmp/qm-tree.tgz .
           ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
             "set -eu; rm -rf '$REMOTE_DIR.incoming'; mkdir -p '$REMOTE_DIR.incoming'"
           scp -o Hostname="$HOST" -o User="$USER_NAME" /tmp/qm-tree.tgz deploy-target:/tmp/qm-tree.tgz
-          scp -o Hostname="$HOST" -o User="$USER_NAME" "$LAYER/.env" "deploy-target:$REMOTE_DIR.incoming.env"
+          scp -o Hostname="$HOST" -o User="$USER_NAME" /tmp/node-host.tar.xz deploy-target:/tmp/node-host.tar.xz
+          scp -o Hostname="$HOST" -o User="$USER_NAME" "$LAYER/.env" "deploy-target:$REMOTE_DIR.incoming.compose.env"
+          scp -o Hostname="$HOST" -o User="$USER_NAME" "$LAYER/.generated/core.runtime.env" "deploy-target:$REMOTE_DIR.incoming.core.env"
           ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
             "REMOTE_DIR='$REMOTE_DIR' LAYER='$LAYER' bash -s" <<'REMOTE'
           set -euo pipefail
+          arch="$(uname -m)"
+          if [ "$arch" != "x86_64" ]; then
+            echo "host is $arch but the shipped Node build is linux-x64" >&2
+            exit 1
+          fi
           tar -xzf /tmp/qm-tree.tgz -C "$REMOTE_DIR.incoming"
           rm -f /tmp/qm-tree.tgz
-          install -m 600 "$REMOTE_DIR.incoming.env" "$REMOTE_DIR.incoming/$LAYER/.env"
-          rm -f "$REMOTE_DIR.incoming.env"
+          install -m 600 "$REMOTE_DIR.incoming.compose.env" "$REMOTE_DIR.incoming/$LAYER/.env"
+          install -m 600 "$REMOTE_DIR.incoming.core.env" "$REMOTE_DIR.incoming/core.env"
+          rm -f "$REMOTE_DIR.incoming.compose.env" "$REMOTE_DIR.incoming.core.env"
+          sudo mkdir -p /opt/node
+          sudo tar -xJf /tmp/node-host.tar.xz -C /opt/node --strip-components=1
+          rm -f /tmp/node-host.tar.xz
+          if [ -d "$REMOTE_DIR/data" ]; then cp -a "$REMOTE_DIR/data" "$REMOTE_DIR.incoming/data"; fi
           rm -rf "$REMOTE_DIR.previous"
-          if [ -d "$REMOTE_DIR" ]; then mv "$REMOTE_DIR" "$REMOTE_DIR.previous"; fi
-          mv "$REMOTE_DIR.incoming" "$REMOTE_DIR"
+          if [ -d "$REMOTE_DIR" ]; then sudo mv "$REMOTE_DIR" "$REMOTE_DIR.previous"; fi
+          sudo mv "$REMOTE_DIR.incoming" "$REMOTE_DIR"
+          REMOTE
+
+      - name: Install core dependencies on the host
+        env:
+          HOST: ${{ secrets.HOST }}
+          USER_NAME: ${{ secrets.USER }}
+          NPM_REGISTRY: ${{ vars.NPM_REGISTRY || 'https://registry.npmmirror.com' }}
+        run: |
+          set -euo pipefail
+          ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
+            "REMOTE_DIR='$REMOTE_DIR' NPM_REGISTRY='$NPM_REGISTRY' bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PATH=/opt/node/bin:$PATH
+          cd "$REMOTE_DIR"
+          npm ci --omit=dev --no-audit --no-fund --registry "$NPM_REGISTRY"
+          node --version
           REMOTE
 
       - name: Build the agent sandbox image
@@ -198,22 +244,30 @@ jobs:
             -t "$SANDBOX_IMAGE" .
           REMOTE
 
-      - name: Build and bring up the control plane
+      - name: Restart core and bring up the surfaces
         env:
           HOST: ${{ secrets.HOST }}
           USER_NAME: ${{ secrets.USER }}
         run: |
           set -euo pipefail
           ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
-            "LAYER_DIR='$REMOTE_DIR/$LAYER' bash -s" <<'REMOTE'
+            "REMOTE_DIR='$REMOTE_DIR' LAYER='$LAYER' DEPLOY_USER='$USER_NAME' bash -s" <<'REMOTE'
           set -euo pipefail
-          cd "$LAYER_DIR"
+          sed -e "s|__DEPLOY_USER__|$DEPLOY_USER|g" \
+              -e "s|__REMOTE_DIR__|$REMOTE_DIR|g" \
+              -e "s|__NODE_BIN__|/opt/node/bin/node|g" \
+              "$REMOTE_DIR/$LAYER/qm-core.service.template" > /tmp/qm-core.service
+          sudo install -m 644 /tmp/qm-core.service /etc/systemd/system/qm-core.service
+          rm -f /tmp/qm-core.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable qm-core
+          sudo systemctl restart qm-core
+          cd "$REMOTE_DIR/$LAYER"
           docker compose build
           docker compose up -d --remove-orphans
-          docker compose ps
           REMOTE
 
-      - name: Gate on every service, not just core
+      - name: Gate on core and every surface
         env:
           HOST: ${{ secrets.HOST }}
           USER_NAME: ${{ secrets.USER }}
@@ -221,36 +275,36 @@ jobs:
         run: |
           set -euo pipefail
           ssh -o Hostname="$HOST" -o User="$USER_NAME" deploy-target \
-            "LAYER_DIR='$REMOTE_DIR/$LAYER' CORE_HOST_PORT='$CORE_HOST_PORT' bash -s" <<'REMOTE'
+            "REMOTE_DIR='$REMOTE_DIR' LAYER='$LAYER' CORE_HOST_PORT='$CORE_HOST_PORT' bash -s" <<'REMOTE'
           set -euo pipefail
-          cd "$LAYER_DIR"
+          cd "$REMOTE_DIR/$LAYER"
           healthy=""
           for attempt in $(seq 1 30); do
             if curl -fsS --max-time 5 "http://127.0.0.1:$CORE_HOST_PORT/healthz" >/dev/null; then
-              healthy=yes
+              healthy="$attempt"
               break
             fi
             sleep 4
           done
           if [ -z "$healthy" ]; then
             echo "core never answered /healthz on port $CORE_HOST_PORT" >&2
-            docker compose logs --tail 80 core >&2
+            sudo journalctl -u qm-core -n 80 --no-pager >&2 || true
             exit 1
           fi
-          echo "core healthy after $attempt attempt(s)"
+          echo "core healthy after $healthy attempt(s)"
           sleep 5
-          stopped="$(docker compose ps --format '{{.Service}} {{.State}}' | awk '$2 != "running" {print $1}')"
+          stopped="$(docker compose ps -a --format '{{.Service}} {{.State}}' | awk '$2 != "running" {print $1}')"
           if [ -n "$stopped" ]; then
-            echo "these services are not running: $stopped" >&2
+            echo "these surfaces are not running: $stopped" >&2
             for svc in $stopped; do
               echo "--- $svc ---" >&2
               docker compose logs --tail 40 "$svc" >&2
             done
             exit 1
           fi
-          docker compose ps
+          docker compose ps -a
           REMOTE
 
       - name: Scrub the runner
         if: always()
-        run: rm -f "$LAYER/.env" ~/.ssh/id_deploy /tmp/qm-tree.tgz
+        run: rm -f "$LAYER/.env" "$LAYER/.generated/core.runtime.env" ~/.ssh/id_deploy /tmp/qm-tree.tgz /tmp/node-host.tar.xz

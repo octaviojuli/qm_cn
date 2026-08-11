@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 VENDOR_DIR="$REPO_ROOT/vendor"
 PKG_NAME="@earendil-works/pi-coding-agent"
 
@@ -29,7 +30,7 @@ else
   echo "    already present, skipping download"
 fi
 
-EXPECTED_FILE="$(dirname "${BASH_SOURCE[0]}")/../pi-tarball.sha256"
+EXPECTED_FILE="$SCRIPT_DIR/../pi-tarball.sha256"
 
 echo "==> verifying sha256 against $EXPECTED_FILE"
 if [[ ! -f "$EXPECTED_FILE" ]]; then
