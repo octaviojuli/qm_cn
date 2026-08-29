@@ -12,6 +12,7 @@ export default tseslint.config(
       "docs/",
       "plugins/web-ui/public/",
       ".claude/",
+      ".agents/",
       ".context/",
     ],
   },

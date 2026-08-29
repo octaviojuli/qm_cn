@@ -1,6 +1,7 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "treatConfigHintsAsErrors": true,
+  "ignore": [".agents/**"],
   "ignoreBinaries": ["flyctl", "tail", "cloudflared"],
   "ignoreDependencies": ["@openai/codex", "opencode-ai"],
   "ignoreIssues": {
