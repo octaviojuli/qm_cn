@@ -6,3 +6,5 @@ data/
 .ci-instance/
 test/live-slack/out/
 deploy/stacks/.generated/
+.agents/
+skills-lock.json
